@@ -1,0 +1,471 @@
+
+from __future__ import print_function
+from keras.models import Sequential, model_from_json
+from keras.layers.core import Dense, Dropout, Activation, Flatten
+from keras.layers.convolutional import Convolution1D, MaxPooling1D
+from keras.layers.normalization import BatchNormalization
+from keras.optimizers import SGD, Adam, Adagrad, Adadelta
+from keras.regularizers import l2, activity_l2
+import numpy as np
+import scipy.io as sio
+
+
+##### Define Parameters
+# Path to the input data-file
+# FILE_PATH = 'data/raw_sensor_data_sr01_240_rand.mat'
+# FILE_PATH = 'data/raw_sensor_data_hs_front_200000_mod.mat'
+# FILE_PATH = 'data/raw_sensor_data_01.mat'
+# FILE_PATH = 'data/raw_sensor_data_so_02.mat'
+# FILE_PATH = 'data/raw_sensor_data_so_front_200000_mod.mat'
+FILE_PATH = 'data/sensor_data_maze_simple_512_noise_20k.mat'
+
+# Percentage of data being training data
+TRAIN_PERC = 0.9
+# Training
+LEARNING_RATE = 0.006
+DECAY = 0.0000		            # lr * (1/(1+decay*epochs))
+DROPOUT_RATE = 0.1
+BATCH_SIZE = 400                # Best: 100
+NUM_HIDDEN_UNITS = 64           # Best: 63
+NUM_EPOCHS = 100
+BETA = 0.000
+QUADR_THETA = False
+TRIM_DATA = False                #
+MODEL_TYPE = 'cnn'
+ACT_FUNCTION = 'sigmoid'
+CNN_ACT_FUNCTION = 'relu'
+LOSS_FUNCTION = 'mae'
+TEST_NUM = 'maze_simple_512_noise_10k_0'                 # Defines the name of the saved file
+TEST_START_NUM = 2
+TEST_NUMBERS = 2
+LOAD_EXISTING_MODEL = False   # Whether existing model should be loaded or new one compiled
+UPDATE_MODEL = False             # Whether it is an ae to update
+MODEL_NAME = 'cnn_maze_simple_angle_mod_02'           # Name of existing model
+
+
+##### Define Functions
+# Load the data out of a .mat file
+def load_data(file, quadr_theta):
+    # Read data from .mat file
+    data_set = sio.loadmat(file)
+    data_x = np.asarray(data_set['data_sensor'], float)
+    data_y = np.asarray(data_set['data_pose'], float)
+    
+    #data_x = data_x[:20000]
+    #data_y = data_y[:20000]
+
+    data_x[data_x == 100.0] = 7.0
+    data_x[data_x == -1.0] = 0.0
+    
+    # Delete first row of sensor data
+    if ('sr' in file) or ('hosp' in file) or TRIM_DATA:
+        data_y = data_y[:data_x.shape[0]-1]
+        data_x = data_x[1:]
+    
+    # print(data_x[29997])
+    # print(data_y[29997])
+    
+    # Randomly permute data
+    #perm = np.random.permutation(data_x.shape[0])
+    #data_x = data_x[perm]
+    #data_y = data_y[perm]
+    
+    # Add bias
+    # bias = np.ones((data_x.shape[0], 1))
+    # data_x = np.append(bias, data_x, 1)
+    
+    # Split data into train and test data
+    train_size = int(data_x.shape[0] * TRAIN_PERC)
+    # train_x = data_x[:train_size, 13:653]
+    train_x = data_x[:train_size]
+    train_y = data_y[:train_size]
+    # test_x = data_x[train_size:, 13:653]
+    test_x = data_x[train_size:]
+    test_y = data_y[train_size:]
+    
+    # Update theta
+    if quadr_theta:
+        train_y[:, 3:4] = train_y[:, 3:4] * train_y[:, 3:4]
+        test_y[:, 3:4] = test_y[:, 3:4] * test_y[:, 3:4]
+    
+    # Define arrays as float32
+    train_x = train_x.astype('float32')
+    train_y = train_y.astype('float32')
+    test_x = test_x.astype('float32')
+    test_y = test_y.astype('float32')
+    
+    # Reshape data
+    if 'cnn' in MODEL_TYPE:
+        train_x = train_x.reshape((train_x.shape[0], train_x.shape[1], 1))
+        test_x = test_x.reshape((test_x.shape[0], test_x.shape[1], 1))
+    
+    
+    return (train_x.shape[1], train_x, train_y, test_x, test_y)
+
+
+# Create a model with just fully connected layers
+def load_model_mlp(input_dim, activation='sigmoid', hidden_layer_size=512,
+                   hidden_layer_num=3):
+    print('Building MLP-Model.')
+    
+    model = Sequential()
+    model.add(BatchNormalization(batch_input_shape=(None, input_dim)))
+    model.add(Dense(hidden_layer_size))
+    model.add(Activation(activation))
+    # for i in range(hidden_layer_num-1):
+    model.add(Dense( hidden_layer_size))
+    model.add(Activation(activation))
+    model.add(Dense( hidden_layer_size))
+    model.add(Activation(activation))
+    model.add(Dense( hidden_layer_size))
+    model.add(Activation(activation))
+    model.add(Dense( hidden_layer_size/4))
+    model.add(Activation(activation))
+    # model.add(Dense( hidden_layer_size /8))
+    # model.add(Activation(activation))
+    # model.add(Dense(hidden_layer_size/16))
+    # model.add(Activation(activation))
+    # model.add(Dense(hidden_layer_size/8))
+    # model.add(Activation(activation))
+    # model.add(Dense(hidden_layer_size/8))
+    # model.add(Activation(activation))
+    # model.add(Dense(hidden_layer_size/8))
+    # model.add(Activation(activation))
+    
+    # model.add(Dropout(0.5))
+    model.add(Dense(3))
+    
+    model.summary()
+    
+    return model
+
+
+# Create a model with convolutional and maxPool layers
+def load_model_cnn(input_dim, data_set_size, l2_reg=0.01, activation='relu',
+                   hidden_layer_size=64, hidden_layer_num=3,
+                   dropout_rate=0.25, cnn_activation='relu'):
+    print('Building CNN-Model.')
+    
+    model = Sequential()
+    
+    # Perfect hidden size:  h, h*2
+    # Perfect pool size  :  8, 8
+    
+    # Convolutional Layer 1
+    model.add(BatchNormalization(input_shape=(input_dim, 1)))
+    model.add(Convolution1D(hidden_layer_size, 3, border_mode='same'))
+    model.add(Activation(cnn_activation))
+    model.add(Convolution1D(hidden_layer_size, 3, border_mode='same'))
+    model.add(Activation(cnn_activation))
+    model.add(MaxPooling1D(pool_length=8, stride=None, border_mode='valid'))
+#    model.add(Dropout(dropout_rate))
+
+    # Convolutional Layer 2
+    model.add(Convolution1D(hidden_layer_size*2, 3, border_mode='same'))
+    model.add(Activation(cnn_activation))
+    model.add(Convolution1D(hidden_layer_size*2, 3, border_mode='same'))
+    model.add(Activation(cnn_activation))
+    model.add(MaxPooling1D(pool_length=8, stride=None, border_mode='valid'))
+#    model.add(Dropout(dropout_rate))
+ 
+    # Fully connected Layer
+    model.add(Flatten())
+    
+    model.add(Dense(hidden_layer_size*8, init='lecun_uniform'))
+    model.add(BatchNormalization())
+    model.add(Activation(activation))
+#    model.add(Dropout(dropout_rate/2))
+    
+    model.add(Dense(hidden_layer_size*8, init='lecun_uniform'))
+    model.add(BatchNormalization())
+    model.add(Activation(activation))
+#    model.add(Dropout(dropout_rate/2))
+
+    model.add(Dense(hidden_layer_size, init='lecun_uniform'))
+    model.add(BatchNormalization())
+    model.add(Activation(activation))
+#    model.add(Dropout(dropout_rate/2))
+
+    model.add(Dense(4))
+    # model.add(Activation('linear'))
+    
+    model.summary()
+    
+    return model
+
+
+# Create a model with convolutional and maxPool layers
+def load_model_cnn_small(input_dim, data_set_size, l2_reg=0.01, activation='relu',
+                   hidden_layer_size=64, hidden_layer_num=3,
+                   dropout_rate=0.25, cnn_activation='relu'):
+    print('Building CNN-Model.')
+    
+    model = Sequential()
+    
+    # Perfect hidden size:  h, h*2
+    # Perfect pool size  :  8, 8
+    
+    # Convolutional Layer 1
+    model.add(BatchNormalization(input_shape=(input_dim, 1)))
+    model.add(Convolution1D(32, 3, border_mode='same', activation=cnn_activation))
+    model.add(Convolution1D(32, 3, border_mode='same', activation=cnn_activation))
+    model.add(MaxPooling1D(pool_length=8, stride=None, border_mode='valid'))
+    # model.add(Dropout(dropout_rate))
+    
+    # Convolutional Layer 2
+    model.add(Convolution1D(32 * 2, 3, border_mode='same', activation=cnn_activation))
+    model.add(Convolution1D(32 * 2, 3, border_mode='same', activation=cnn_activation))
+    model.add(MaxPooling1D(pool_length=8, stride=None, border_mode='valid'))
+    # model.add(Dropout(dropout_rate))
+    
+    # Convolutional Layer 2
+    model.add(Convolution1D(32 * 2, 3, border_mode='same', activation=cnn_activation))
+    model.add(Convolution1D(32 * 2, 3, border_mode='same', activation=cnn_activation))
+    model.add(MaxPooling1D(pool_length=8, stride=None, border_mode='valid'))
+    # model.add(Dropout(dropout_rate))
+
+    
+    # Fully connected Layer
+    model.add(Flatten())
+    
+    l = 512
+    
+    model.add(Dense(l, init='lecun_uniform'))
+    model.add(BatchNormalization())
+    model.add(Activation(activation))
+    # model.add(Dropout(dropout_rate / 2))
+    
+    model.add(Dense(l, init='lecun_uniform'))
+    model.add(BatchNormalization())
+    model.add(Activation(activation))
+    # model.add(Dropout(dropout_rate / 2))
+    
+    model.add(Dense(l/8, init='lecun_uniform'))
+    model.add(BatchNormalization())
+    model.add(Activation(activation))
+    # model.add(Dropout(dropout_rate / 2))
+    
+    model.add(Dense(3))
+    # model.add(Activation('linear'))
+    
+    model.summary()
+    
+    return model
+
+
+def load_model_autoenc_old(old_model, input_dim, data_set_size, l2_reg=0.01, activation='relu',
+                   hidden_layer_size=64, hidden_layer_num=3,
+                   dropout_rate=0.25):
+    
+    # Pop all unnecessary layers
+    # for i in range(11):
+    #     layer = model.layers.pop()
+
+    model = Sequential()
+
+    # Convolutional Layer 1
+    model.add(Convolution1D(8, 3, border_mode='same', trainable=False,
+                            activation='relu', input_shape=(input_dim, 1),
+                            weights=old_model.layers[0].get_weights()))
+    model.add(Convolution1D(8, 3, border_mode='same', trainable=False,
+                            activation='relu',
+                            weights=old_model.layers[1].get_weights()))
+    model.add(MaxPooling1D(pool_length=4, stride=None, border_mode='valid'))
+    # model.add(Dropout(dropout_rate))
+
+    # Convolutional Layer 2
+    model.add(Convolution1D(16, 3, border_mode='same', trainable=False,
+                            activation='relu', weights=old_model.layers[3].get_weights()))
+    model.add(Convolution1D(16, 3, border_mode='same', trainable=False,
+                            activation='relu', weights=old_model.layers[4].get_weights()))
+    model.add(MaxPooling1D(pool_length=4, stride=None, border_mode='valid'))
+
+    # Fully connected Layer
+    model.add(Flatten())
+
+    # model.add(Dense(8, W_regularizer=l2(l2_reg),
+    #                 init='lecun_uniform'))
+    # model.add(BatchNormalization(epsilon=0.001, mode=0))
+    # model.add(Activation(activation))
+    # model.add(Dropout(dropout_rate / 2))
+
+    model.add(Dense(hidden_layer_size * 8, W_regularizer=l2(l2_reg),
+                    init='lecun_uniform'))
+    model.add(BatchNormalization(epsilon=0.001, mode=0))
+    model.add(Activation(activation))
+    # model.add(Dropout(dropout_rate / 2))
+
+    model.add(Dense(hidden_layer_size * 8, W_regularizer=l2(l2_reg),
+                    init='lecun_uniform'))
+    model.add(BatchNormalization(epsilon=0.001, mode=0))
+    model.add(Activation(activation))
+    # model.add(Dropout(dropout_rate / 2))
+
+    model.add(Dense(hidden_layer_size, W_regularizer=l2(l2_reg),
+                    init='lecun_uniform'))
+    model.add(BatchNormalization(epsilon=0.001, mode=0))
+    model.add(Activation(activation))
+    # model.add(Dropout(dropout_rate / 2))
+
+    model.add(Dense(3))
+    model.add(Activation('linear', name='act5'))
+
+    model.summary()
+
+    return model
+
+
+def load_model_autoenc(old_model, input_dim, data_set_size, l2_reg=0.01, activation='relu',
+                       hidden_layer_size=64, hidden_layer_num=3,
+                       dropout_rate=0.25):
+    # Pop all unnecessary layers
+    # for i in range(11):
+    #     layer = model.layers.pop()
+    
+    model = Sequential()
+    
+    # Convolutional Layer 1
+    model.add(Convolution1D(4, 3, border_mode='same', trainable=False,
+                            activation='relu', input_shape=(input_dim, 1),
+                            weights=old_model.layers[0].get_weights()))
+    model.add(Convolution1D(4, 3, border_mode='same', trainable=False,
+                            activation='relu',
+                            weights=old_model.layers[1].get_weights()))
+    model.add(MaxPooling1D(pool_length=2, stride=None, border_mode='valid'))
+    # model.add(Dropout(dropout_rate))
+    
+    # Convolutional Layer 2
+    model.add(Convolution1D(8, 3, border_mode='same', trainable=False,
+                            activation='relu', weights=old_model.layers[3].get_weights()))
+    model.add(Convolution1D(8, 3, border_mode='same', trainable=False,
+                            activation='relu', weights=old_model.layers[4].get_weights()))
+    model.add(MaxPooling1D(pool_length=2, stride=None, border_mode='valid'))
+    
+    # Convolutional Layer 2
+    # model.add(Convolution1D(8, 3, border_mode='same', trainable=False,
+    #                         activation='relu', weights=old_model.layers[3].get_weights()))
+    # model.add(MaxPooling1D(pool_length=2, stride=None, border_mode='valid'))
+    
+    # Fully connected Layer
+    model.add(Flatten())
+    
+    # model.add(Dense(8, W_regularizer=l2(l2_reg),
+    #                 init='lecun_uniform'))
+    # model.add(BatchNormalization(epsilon=0.001, mode=0))
+    # model.add(Activation(activation))
+    # model.add(Dropout(dropout_rate / 2))
+    
+    model.add(Dense(512, W_regularizer=l2(l2_reg),
+                    init='lecun_uniform'))
+    model.add(BatchNormalization(epsilon=0.001, mode=0))
+    model.add(Activation(activation))
+    # model.add(Dropout(dropout_rate / 2))
+    
+    model.add(Dense(512, W_regularizer=l2(l2_reg),
+                    init='lecun_uniform'))
+    model.add(BatchNormalization(epsilon=0.001, mode=0))
+    model.add(Activation(activation))
+    # model.add(Dropout(dropout_rate / 2))
+    
+    model.add(Dense(64, W_regularizer=l2(l2_reg),
+                    init='lecun_uniform'))
+    model.add(BatchNormalization(epsilon=0.001, mode=0))
+    model.add(Activation(activation))
+    # model.add(Dropout(dropout_rate / 2))
+    
+    model.add(Dense(3))
+    model.add(Activation('linear', name='act5'))
+    
+    model.summary()
+    
+    return model
+
+
+if __name__ == '__main__':
+    
+    # Load data
+    (x_dim, train_x, train_y, test_x, test_y) = load_data(FILE_PATH, QUADR_THETA)
+
+    init_test_num = TEST_NUM
+    init_model_name = MODEL_NAME
+
+    for iter in range(TEST_NUMBERS):
+        iter += TEST_START_NUM
+        
+        TEST_NUM = init_test_num + str(iter)
+        MODEL_NAME = init_model_name #+ str(iter)
+
+        if LOAD_EXISTING_MODEL:
+            # Load model from existing data
+            # Load json and create model
+            json_file = open('data/model_' + MODEL_NAME + '.json', 'r')
+            loaded_model_json = json_file.read()
+            json_file.close()
+            model = model_from_json(loaded_model_json)
+    
+            # Load weights into new model
+            model.load_weights('data/model_' + MODEL_NAME + '.h5')
+            print('Loaded model from disk')
+            
+            model.summary()
+    
+            if UPDATE_MODEL:
+                # Load layers for model
+                model = load_model_autoenc(model, x_dim, train_x.shape[0],
+                                           activation=ACT_FUNCTION,
+                                           hidden_layer_size=NUM_HIDDEN_UNITS,
+                                           l2_reg=BETA,
+                                           dropout_rate=DROPOUT_RATE)
+        
+        else:
+            # Load layers for model
+            if 'cnn' in MODEL_TYPE:
+                model = load_model_cnn(x_dim, train_x.shape[0], activation=ACT_FUNCTION,
+                                       hidden_layer_size=NUM_HIDDEN_UNITS, l2_reg=BETA,
+                                       dropout_rate=DROPOUT_RATE, cnn_activation=CNN_ACT_FUNCTION)
+            else:
+                model = load_model_mlp(x_dim, activation=ACT_FUNCTION, hidden_layer_size=NUM_HIDDEN_UNITS)
+    
+        # print(model.layers[0].get_weights())
+    
+        # Optimizers
+        # sgd = SGD(lr=LEARNING_RATE, decay=1e-6, momentum=0.9, nesterov=True)
+        adam = Adam(lr=LEARNING_RATE, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=DECAY)
+        # adag = Adagrad(lr=LEARNING_RATE, epsilon=1e-08, decay=0.0)      # Not bad with lr=0.01
+        # adad = Adadelta(lr=LEARNING_RATE, rho=0.95, epsilon=1e-08, decay=0.0)
+    
+        # Compile model
+        model.compile(loss=LOSS_FUNCTION, #metrics=['accuracy'],
+                      optimizer=adam)
+        
+        print('Start training CNN Number:  ', iter)
+        
+        # Print parameter information
+        print('')
+        print('Parameters:')
+    
+        print('Learning Rate = ', LEARNING_RATE)
+        print('LR Decay      = ', DECAY)
+        print('Dropout       = ', DROPOUT_RATE)
+        print('Batch Size    = ', BATCH_SIZE)
+        print('Hidden Layer  = ', NUM_HIDDEN_UNITS)
+        print('Optimizer     =  Adam')
+        print('Loss          = ', LOSS_FUNCTION)
+        print('')
+        
+        history = model.fit(train_x, train_y, batch_size=BATCH_SIZE, nb_epoch=NUM_EPOCHS,
+                            validation_data=(test_x, test_y), shuffle=True)
+        
+        
+        
+        # Save eval-data
+        sio.savemat('data/eval-data_cnn_'+TEST_NUM+'.mat', history.history)
+        
+        # serialize model to JSON
+        model_json = model.to_json()
+        with open('data/model_cnn_'+TEST_NUM+'.json', 'w') as json_file:
+            json_file.write(model_json)
+        # serialize weights to HDF5
+        model.save_weights('data/model_cnn_'+TEST_NUM+'.h5')
+        print('Saved model to disk')
+        
